@@ -36,7 +36,7 @@ def generate_output_path(parsed_filename: Dict[str, str], output_dir: str) -> st
     """Generate the output file path based on the parsed filename."""
     show_dir = os.path.join(output_dir, parsed_filename["show_name"])
     season_dir = os.path.join(show_dir, f"S{parsed_filename['season']}")
-    output_file = f"E{parsed_filename['episode']}.mkv"
+    output_file = f"E{parsed_filename['episode']}. {parsed_filename['episode_name']}.mkv"
     return os.path.join(season_dir, output_file)
 
 def get_audio_channels(ffprobe_data: Dict[str, any]) -> List[int]:
