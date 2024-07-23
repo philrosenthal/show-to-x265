@@ -6,12 +6,11 @@ import re
 import subprocess
 import threading
 import time
-from queue import Queue
+from queue import Queue, Empty
 from typing import List, Dict
 
 logging.basicConfig(filename='encoding_log.txt', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 def is_lossless_audio(codec_name: str) -> bool:
     """Determine if the audio codec is lossless compression."""
@@ -52,7 +51,7 @@ def generate_ffmpeg_command(input_file: str, output_file: str, ffprobe_data: Dic
         "-map", "0",  # Map all streams from input to output
         "-c", "copy",  # Start by copying all streams
         "-c:v", "libx265",
-        "-crf", "23",
+        "-crf", "18",
         "-preset", "veryslow",
         "-x265-params", "rect=1:amp=1:bframes=16",
         "-f", "matroska"  # Explicitly specify the output format
@@ -95,13 +94,50 @@ class EncodingJob:
         self.progress = 0
         self.estimated_time_remaining = None
         self.status = "Queued"
+        self.current_size = None
+        self.estimated_final_size = None
 
-def worker(job_queue: Queue, active_jobs: Dict[str, EncodingJob]):
+def format_time(seconds):
+    """Format seconds into days, hours, minutes, and seconds."""
+    days, remainder = divmod(int(seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def check_incomplete_file(output_file: str) -> bool:
+    """
+    Check if an incomplete file exists and is being actively worked on.
+    Returns True if the file should be skipped, False otherwise.
+    """
+    incomplete_file = f"{output_file}.incomplete"
+    if os.path.exists(incomplete_file):
+        mtime = os.path.getmtime(incomplete_file)
+        if time.time() - mtime < 300:  # 5 minutes
+            logging.info(f"Skipping {output_file}: Incomplete file is being actively worked on")
+            return True
+        else:
+            logging.info(f"Removing stale incomplete file: {incomplete_file}")
+            os.remove(incomplete_file)
+    return False
+
+def worker(job_queue: Queue, active_jobs: Dict[str, EncodingJob], should_quit: threading.Event):
     """Worker function to process encoding jobs."""
-    while True:
-        job = job_queue.get()
+    while not should_quit.is_set():
+        try:
+            job = job_queue.get(timeout=1)
+        except Empty:
+            continue
+
         if job is None:
             break
+
+        # Check for incomplete file just before starting the job
+        if check_incomplete_file(job.output_file):
+            job_queue.task_done()
+            continue
 
         incomplete_file = f"{job.output_file}.incomplete"
         log_file = f"{os.path.splitext(job.output_file)[0]}.txt"
@@ -120,7 +156,7 @@ def worker(job_queue: Queue, active_jobs: Dict[str, EncodingJob]):
                     log.write(line)
                     log.flush()
                     
-                    # Update progress
+                    # Update progress and file size
                     if "time=" in line:
                         time_match = re.search(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})", line)
                         if time_match:
@@ -130,6 +166,10 @@ def worker(job_queue: Queue, active_jobs: Dict[str, EncodingJob]):
                             
                             elapsed_time = time.time() - job.start_time
                             job.estimated_time_remaining = (elapsed_time / job.progress) * (100 - job.progress) if job.progress > 0 else None
+
+                            # Update current size and estimate final size
+                            job.current_size = os.path.getsize(incomplete_file)
+                            job.estimated_final_size = job.current_size / (job.progress / 100) if job.progress > 0 else None
 
             process.wait()
             
@@ -154,15 +194,30 @@ def display_status(active_jobs: Dict[str, EncodingJob]):
     """Display the current status of encoding jobs."""
     os.system('clear' if os.name == 'posix' else 'cls')
     print("Encoding Status:")
-    for input_file, job in active_jobs.items():
+    jobs_copy = dict(active_jobs)
+    for input_file, job in jobs_copy.items():
         print(f"\n{os.path.basename(input_file)}:")
         print(f"  Status: {job.status}")
         if job.start_time:
             elapsed_time = time.time() - job.start_time
             print(f"  Progress: {job.progress:.2f}%")
-            print(f"  Elapsed Time: {time.strftime('%H:%M:%S', time.gmtime(elapsed_time))}")
+            print(f"  Elapsed Time: {format_time(elapsed_time)}")
             if job.estimated_time_remaining:
-                print(f"  Estimated Time Remaining: {time.strftime('%H:%M:%S', time.gmtime(job.estimated_time_remaining))}")
+                print(f"  Estimated Time Remaining: {format_time(job.estimated_time_remaining)}")
+        if job.current_size is not None and job.estimated_final_size is not None:
+            print(f"  Current Size: {job.current_size / (1024*1024):.2f} MB")
+            print(f"  Estimated Final Size: {job.estimated_final_size / (1024*1024):.2f} MB")
+            original_size = os.path.getsize(job.input_file)
+            size_savings = (original_size - job.estimated_final_size) / original_size * 100
+            print(f"  Estimated Size Savings: {size_savings:.2f}%")
+
+def check_for_quit(should_quit):
+    """Check for 'Q' input to quit gracefully."""
+    while True:
+        if input().lower() == 'q':
+            should_quit.set()
+            print("Quitting after current jobs finish. Press Ctrl+C to force quit.")
+            break
 
 def main():
     parser = argparse.ArgumentParser(description="Re-encode video files using ffmpeg.")
@@ -173,35 +228,47 @@ def main():
     job_queue = Queue()
     active_jobs = {}
     threads = []
+    should_quit = threading.Event()
 
     for _ in range(3):  # Create 3 worker threads
-        t = threading.Thread(target=worker, args=(job_queue, active_jobs))
+        t = threading.Thread(target=worker, args=(job_queue, active_jobs, should_quit))
         t.start()
         threads.append(t)
+
+    # Start thread to check for quit command
+    quit_thread = threading.Thread(target=check_for_quit, args=(should_quit,))
+    quit_thread.daemon = True
+    quit_thread.start()
 
     for input_file in args.input_files:
         parsed_filename = parse_filename(input_file)
         if parsed_filename:
             output_file = generate_output_path(parsed_filename, args.output_dir)
-            if not os.path.exists(output_file):
+            if not os.path.exists(output_file) and not check_incomplete_file(output_file):
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
                 job = EncodingJob(input_file, output_file)
                 job_queue.put(job)
                 active_jobs[input_file] = job
                 logging.info(f"Queued for encoding: {input_file}")
             else:
-                logging.info(f"Skipping {input_file}: Output file already exists")
+                logging.info(f"Skipping {input_file}: Output file already exists or is being processed")
         else:
             logging.warning(f"Skipping {input_file}: Unable to parse filename")
+
+    # Display status
+    while not job_queue.empty() or active_jobs:
+        try:
+            display_status(active_jobs)
+        except Exception as e:
+            logging.error(f"Error displaying status: {str(e)}")
+        time.sleep(5)
+
+        if should_quit.is_set() and job_queue.empty():
+            break
 
     # Add None to the queue to signal the workers to exit
     for _ in range(3):
         job_queue.put(None)
-
-    # Display status
-    while not job_queue.empty() or active_jobs:
-        display_status(active_jobs)
-        time.sleep(5)
 
     # Wait for all threads to complete
     for t in threads:
